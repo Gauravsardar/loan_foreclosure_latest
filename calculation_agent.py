@@ -56,7 +56,10 @@ class CalculationAgent:
         required_fields = []
 
         if "emi" in query_lower or "monthly payment" in query_lower:
-            required_fields = ["loan_amount", "interest_rate", "loan_tenure"]
+            if "add" in query_lower and ("tenure" in query_lower or "affect" in query_lower):
+                required_fields = ["outstanding_amount", "interest_rate", "loan_tenure_months", "emi_amount"]
+            else:
+                required_fields = ["loan_amount", "interest_rate", "loan_tenure"]
         elif "penalty" in query_lower or "foreclose" in query_lower:
             required_fields = ["delinquency_period", "principal", "interest_rate", "loan_start_date", "foreclosure_status"]
 
@@ -66,7 +69,7 @@ class CalculationAgent:
         for field in required_fields:
             if field not in state["user_data"] or state["user_data"][field] is None:
                 state["missing_fields"].append(field)
-            elif field in ["loan_amount", "principal", "interest_rate"]:
+            elif field in ["loan_amount", "principal", "interest_rate", "outstanding_amount", "emi_amount"]:
                 try:
                     state["user_data"][field] = float(state["user_data"][field])
                     if state["user_data"][field] <= 0:
@@ -84,6 +87,15 @@ class CalculationAgent:
                 except (ValueError, TypeError):
                     state["missing_fields"].append(field)
                     logger.warning(f"Invalid loan_tenure format: {state['user_data'][field]}")
+            elif field == "loan_tenure_months":
+                try:
+                    state["user_data"][field] = int(state["user_data"][field])
+                    if state["user_data"][field] <= 0:
+                        state["missing_fields"].append(field)
+                        logger.warning(f"Invalid loan_tenure_months: {state['user_data'][field]}")
+                except (ValueError, TypeError):
+                    state["missing_fields"].append(field)
+                    logger.warning(f"Invalid loan_tenure_months format: {state['user_data'][field]}")
             elif field == "loan_start_date":
                 from datetime import datetime
                 try:
@@ -146,6 +158,12 @@ class CalculationAgent:
                 state["user_data"][field] = "2020-01-01"
             elif field == "foreclosure_status":
                 state["user_data"][field] = "Not Started"
+            elif field == "outstanding_amount":
+                state["user_data"][field] = state["user_data"].get("loan_amount", 100000)
+            elif field == "loan_tenure_months":
+                state["user_data"][field] = 360
+            elif field == "emi_amount":
+                state["user_data"][field] = 1000
         logger.info(f"Simulated user input for missing fields: {state['user_data']}")
         return state
 
@@ -163,32 +181,71 @@ class CalculationAgent:
         calculation_result = {"type": "", "value": 0, "details": {}}
 
         if "emi" in query_lower or "monthly payment" in query_lower:
-            principal = float(user_data["loan_amount"])
-            annual_rate = float(user_data["interest_rate"]) / 100
-            monthly_rate = annual_rate / 12
-            tenure_months = int(user_data["loan_tenure"])
-            try:
-                emi = (principal * monthly_rate * (1 + monthly_rate) ** tenure_months) / \
-                      ((1 + monthly_rate) ** tenure_months - 1)
-                calculation_result = {
-                    "type": "EMI",
-                    "value": round(emi, 2),
-                    "details": {
-                        "loan_amount": principal,
-                        "interest_rate": annual_rate * 100,
-                        "loan_tenure_months": tenure_months
+            if "add" in query_lower and ("tenure" in query_lower or "affect" in query_lower):
+                # Calculate new tenure with increased EMI
+                outstanding_amount = float(user_data["outstanding_amount"])
+                annual_rate = float(user_data["interest_rate"]) / 100
+                monthly_rate = annual_rate / 12
+                original_emi = float(user_data["emi_amount"])
+                original_tenure = int(user_data["loan_tenure_months"])
+                new_emi = original_emi + 500
+
+                try:
+                    # Calculate new tenure: n = log(PMT / (PMT - r * P)) / log(1 + r)
+                    # PMT = new EMI, r = monthly rate, P = outstanding amount
+                    denominator = math.log(1 + monthly_rate)
+                    numerator = math.log(new_emi / (new_emi - monthly_rate * outstanding_amount))
+                    new_tenure = numerator / denominator if (new_emi - monthly_rate * outstanding_amount) > 0 else float('inf')
+
+                    new_tenure = round(new_tenure, 2)
+                    if new_tenure <= 0 or math.isinf(new_tenure):
+                        state["response"] = "Error: The new EMI is insufficient to reduce the loan tenure."
+                        logger.error("Invalid new tenure calculated.")
+                        return state
+
+                    calculation_result = {
+                        "type": "EMI Adjustment",
+                        "value": new_emi,
+                        "details": {
+                            "original_emi": original_emi,
+                            "new_emi": new_emi,
+                            "original_tenure_months": original_tenure,
+                            "new_tenure_months": new_tenure,
+                            "outstanding_amount": outstanding_amount,
+                            "interest_rate": annual_rate * 100
+                        }
                     }
-                }
-                # Cross-check with user_data emi_amount if available
-                if "emi_amount" in user_data and user_data["emi_amount"] is not None:
-                    stored_emi = float(user_data["emi_amount"])
-                    if abs(emi - stored_emi) > 0.01:
-                        logger.warning(f"EMI calculation mismatch: Calculated {emi}, Stored {stored_emi}")
-                        calculation_result["details"]["note"] = f"Calculated EMI differs from stored EMI ({stored_emi}). Using calculated value."
-            except Exception as e:
-                state["response"] = f"Error calculating EMI: {str(e)}"
-                logger.error(f"EMI calculation error: {str(e)}")
-                return state
+                except Exception as e:
+                    state["response"] = f"Error calculating new tenure: {str(e)}"
+                    logger.error(f"New tenure calculation error: {str(e)}")
+                    return state
+            else:
+                # Standard EMI calculation
+                principal = float(user_data["loan_amount"])
+                annual_rate = float(user_data["interest_rate"]) / 100
+                monthly_rate = annual_rate / 12
+                tenure_months = int(user_data["loan_tenure"])
+                try:
+                    emi = (principal * monthly_rate * (1 + monthly_rate) ** tenure_months) / \
+                          ((1 + monthly_rate) ** tenure_months - 1)
+                    calculation_result = {
+                        "type": "EMI",
+                        "value": round(emi, 2),
+                        "details": {
+                            "loan_amount": principal,
+                            "interest_rate": annual_rate * 100,
+                            "loan_tenure_months": tenure_months
+                        }
+                    }
+                    if "emi_amount" in user_data and user_data["emi_amount"] is not None:
+                        stored_emi = float(user_data["emi_amount"])
+                        if abs(emi - stored_emi) > 0.01:
+                            logger.warning(f"EMI calculation mismatch: Calculated {emi}, Stored {stored_emi}")
+                            calculation_result["details"]["note"] = f"Calculated EMI differs from stored EMI ({stored_emi}). Using calculated value."
+                except Exception as e:
+                    state["response"] = f"Error calculating EMI: {str(e)}"
+                    logger.error(f"EMI calculation error: {str(e)}")
+                    return state
 
         elif "penalty" in query_lower or "foreclose" in query_lower:
             from datetime import datetime
@@ -196,10 +253,9 @@ class CalculationAgent:
             annual_rate = float(user_data["interest_rate"]) / 100
             loan_start_date = datetime.strptime(user_data["loan_start_date"], "%Y-%m-%d")
             current_date = datetime.now()
-            tenure_months = user_data.get("loan_tenure", 360)  # Default 30 years
+            tenure_months = user_data.get("loan_tenure", 360)
             months_passed = (current_date.year - loan_start_date.year) * 12 + current_date.month - loan_start_date.month
             remaining_months = max(0, tenure_months - months_passed)
-            # Penalty: 2% of principal for remaining tenure > 12 months, 1% for <= 12 months
             penalty_rate = 0.02 if remaining_months > 12 else 0.01
             penalty = principal * penalty_rate
             calculation_result = {
@@ -213,7 +269,6 @@ class CalculationAgent:
                     "foreclosure_status": user_data.get("foreclosure_status", "Not Started")
                 }
             }
-            # Cross-check with user_data penalty if available
             if "penalty" in user_data and user_data["penalty"] is not None:
                 stored_penalty = float(user_data["penalty"])
                 if abs(penalty - stored_penalty) > 0.01:
@@ -223,7 +278,7 @@ class CalculationAgent:
         state["calculation_result"] = calculation_result
 
         response_prompt = ChatPromptTemplate.from_template(
-            """You are a bank calculation assistant. Provide a concise, professional response with the calculation results in a tabular format using plain text. Include only validated data used in the calculation. If a mismatch with stored data is noted, include the note in the table.
+            """You are a bank calculation assistant. Provide a concise, professional response with the calculation results in a tabular format using plain text. Include only validated data used in the calculation. If a mismatch with stored data is noted, include the note in the table. For EMI adjustment queries, include original EMI, new EMI, original tenure, and new tenure in the table.
 
             User Query:
             {query}
